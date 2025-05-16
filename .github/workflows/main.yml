@@ -1,0 +1,13 @@
+name: Keep Render Service Awake
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping-render:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hit Render docs endpoint
+        run: curl -fsS https://depression-api-e0l4.onrender.com/docs || echo "Render ping failed"
