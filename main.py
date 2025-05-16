@@ -11,21 +11,12 @@ from contextlib import asynccontextmanager
 # 1) Define the request schema
 # ----------------------------------------------------------------------
 class DepressionInput(BaseModel):
-    Degree: str
-    City: str
-    Gender: str
-    Age: int
-    Dietary_Habits: str
-    Sleep_Duration: str
-    Suicidal_Thoughts: bool
-    Family_History: bool
-    CGPA: float                 # raw on 0–10 scale
-    Academic_Pressure: float
-    Work_Pressure: float
-    Study_Satisfaction: float
-    Job_Satisfaction: float
-    Work_Study_Hours: float
-    Financial_Stress: float
+    Age: int = None
+    Dietary_Habits: str = None
+    Suicidal_Thoughts: bool = None
+    Academic_Pressure: float = None
+    Financial_Stress: float = None
+    Study_Satisfaction: float = None
 
 # ----------------------------------------------------------------------
 # 2) Load model, scaler, encoders & selected_features at startup
@@ -43,15 +34,7 @@ async def lifespan(app: FastAPI):
 
     # Load LabelEncoders
     encoders = {}
-    for col in [
-        'degree',
-        'city',
-        'gender',
-        'dietary_habits',
-        'sleep_duration',
-        'suicidal_thoughts',
-        'family_history'
-    ]:
+    for col in ['dietary_habits', 'suicidal_thoughts']:
         with open(f"le_{col}.pkl", "rb") as f:
             encoders[col] = pickle.load(f)
 
@@ -68,39 +51,27 @@ app = FastAPI(lifespan=lifespan)
 # 3) Preprocessing helper – now only emits selected_features
 # ----------------------------------------------------------------------
 def preprocess(payload: DepressionInput) -> np.ndarray:
-    # 1) Rescale CGPA to 0–4
-    cgpa_scaled = (payload.CGPA / 10) * 4
+    # Build a full dict of all possible features
+    features_dict = {}
+    
+    # Encode string categories
+    features_dict['dietary_habits'] = encoders['dietary_habits'].transform([payload.Dietary_Habits])[0]
+    
+    # Encode boolean fields ("Yes"/"No")
+    val_str = "Yes" if payload.Suicidal_Thoughts else "No"
+    features_dict['suicidal_thoughts'] = encoders['suicidal_thoughts'].transform([val_str])[0]
+    
+    # Numeric features
+    features_dict['age'] = payload.Age
+    features_dict['academic_pressure'] = payload.Academic_Pressure
+    features_dict['financial_stress'] = payload.Financial_Stress
+    features_dict['study_satisfaction'] = payload.Study_Satisfaction
     
 
-    # 2) Build a full dict of all possible features
-    features_dict = {}
-    # 2a) Encode string categories
-    for field in ['Degree', 'City', 'Gender', 'Dietary_Habits', 'Sleep_Duration']:
-        key = field.lower()
-        val = getattr(payload, field)
-        features_dict[key] = encoders[key].transform([val])[0]
-
-    # 2b) Encode boolean fields ("Yes"/"No")
-    for field in ['Suicidal_Thoughts', 'Family_History']:
-        key = field.lower()
-        val = getattr(payload, field)
-        val_str = "Yes" if val else "No"
-        features_dict[key] = encoders[key].transform([val_str])[0]
-
-    # 2c) Numeric features
-    features_dict['cgpa_scaled']      = cgpa_scaled
-    features_dict['academic_pressure'] = payload.Academic_Pressure
-    features_dict['work_pressure']     = payload.Work_Pressure
-    features_dict['study_satisfaction'] = payload.Study_Satisfaction
-    features_dict['job_satisfaction']   = payload.Job_Satisfaction
-    features_dict['work_study_hours']   = payload.Work_Study_Hours
-    features_dict['financial_stress']   = payload.Financial_Stress
-    features_dict['age'] = payload.Age
-
-    # 3) Select only the features you saved earlier
+    # Select only the features you saved earlier
     raw = [features_dict[f] for f in selected_features]
 
-    # 4) Scale to the model’s expected range
+    # Scale to the model's expected range
     arr = np.array(raw, dtype=np.float32).reshape(1, -1)
     return scaler.transform(arr)
 

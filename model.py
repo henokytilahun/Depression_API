@@ -101,7 +101,7 @@ importance_df = (
 # ───────────────────────────────────────────────────────────────────────────────
 # 4) Select top K features
 # ───────────────────────────────────────────────────────────────────────────────
-TOP_K = 5
+TOP_K = 6
 top_features = importance_df['Feature'].head(TOP_K).tolist()
 
 # persist for your FastAPI app
