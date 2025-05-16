@@ -1,108 +1,157 @@
 import numpy as np
-import matplotlib.pyplot as plt
 import pandas as pd
+import shap
+import json
+import pickle
+
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+
 import tensorflow as tf
 from tensorflow import keras
-import shap
 
+# ───────────────────────────────────────────────────────────────────────────────
 # 1) Load & preprocess
+# ───────────────────────────────────────────────────────────────────────────────
 df = pd.read_csv('Student_Depression_Dataset.csv')
 
-# Replace id with 0..n-1
+# drop unused, reset id
 df['id'] = np.arange(len(df))
-
-# Rescale CGPA from 0–10 to 0–4
-df['CGPA'] = df['CGPA'].apply(lambda x: (x / 10) * 4)
-
-# Encode categorical features
-le = LabelEncoder()
-for col in ['Degree', 'City', 'Gender', 'Dietary Habits', 'Sleep Duration']:
-    df[col] = le.fit_transform(df[col])
-
-# Rename and encode the remaining categorical columns
+df['CGPA'] = df['CGPA'].apply(lambda x: (x/10)*4)
 df.rename(columns={
     'Have you ever had suicidal thoughts ?': 'Suicidal Thoughts',
     'Family History of Mental Illness': 'Family History'
 }, inplace=True)
-df['Suicidal Thoughts'] = le.fit_transform(df['Suicidal Thoughts'])
-df['Family History']    = le.fit_transform(df['Family History'])
 
-# 2) Define feature matrix X and target vector y (target is Depression)
-X = df.drop(['id', 'Profession', 'Depression'], axis=1)
-y = df['Depression']
+# encode categoricals
+cat_cols = [
+    'Degree','City','Gender',
+    'Dietary Habits','Sleep Duration',
+    'Suicidal Thoughts','Family History'
+]
+encoders = {}
+for col in cat_cols:
+    le = LabelEncoder()
+    df[col] = le.fit_transform(df[col])
+    encoders[col] = le
 
-# Fill missing values with column means and cast to float32
-X = X.fillna(X.mean()).astype(np.float32)
-y = y.astype(np.float32)
+# build feature matrix + target
+X = df.drop(['id','Profession','Depression'], axis=1)
+feature_names = X.columns.tolist()
+y = df['Depression'].astype(np.float32)
 
-# 3) Train/test split
+# fill + scale
+X = X.fillna(X.mean())
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X).astype(np.float32)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 2) Initial split + model for SHAP
+# ───────────────────────────────────────────────────────────────────────────────
 X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42
+    X_scaled, y, test_size=0.2, random_state=42
 )
 
-# 4) Build & train the Keras model
-model = keras.Sequential([
-    keras.layers.Dense(64, activation='relu', input_shape=(X_train.shape[1],)),
-    keras.layers.Dropout(0.2),
-    keras.layers.Dense(32, activation='relu'),
-    keras.layers.Dropout(0.2),
-    keras.layers.Dense(1, activation='sigmoid')
-])
-model.compile(
-    optimizer='adam',
+def build_model(input_dim):
+    return keras.Sequential([
+        keras.layers.BatchNormalization(input_shape=(input_dim,)),
+        keras.layers.Dense(128, activation='relu', kernel_regularizer=keras.regularizers.l2(0.01)),
+        keras.layers.BatchNormalization(), keras.layers.Dropout(0.3),
+        keras.layers.Dense(64, activation='relu', kernel_regularizer=keras.regularizers.l2(0.01)),
+        keras.layers.BatchNormalization(), keras.layers.Dropout(0.3),
+        keras.layers.Dense(32, activation='relu', kernel_regularizer=keras.regularizers.l2(0.01)),
+        keras.layers.BatchNormalization(), keras.layers.Dropout(0.3),
+        keras.layers.Dense(1, activation='sigmoid')
+    ])
+
+initial_model = build_model(X_train.shape[1])
+initial_model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=1e-3),
     loss='binary_crossentropy',
     metrics=['accuracy']
 )
-
-model.fit(
+initial_model.fit(
     X_train, y_train,
-    epochs=50,
+    epochs=20,
     batch_size=32,
     validation_split=0.2,
+    verbose=0
+)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 3) SHAP feature importance
+# ───────────────────────────────────────────────────────────────────────────────
+def pred_fn(x): 
+    return initial_model.predict(x).flatten()
+
+background = X_train[np.random.choice(len(X_train), 100, replace=False)]
+explainer = shap.KernelExplainer(pred_fn, background)
+shap_vals = explainer.shap_values(X_test[:100], nsamples=200)
+
+mean_abs_shap = np.abs(shap_vals).mean(axis=0)
+importance_df = (
+    pd.DataFrame({
+        'Feature': feature_names,
+        'Mean|SHAP|': mean_abs_shap
+    })
+    .sort_values('Mean|SHAP|', ascending=False)
+    .reset_index(drop=True)
+)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 4) Select top K features
+# ───────────────────────────────────────────────────────────────────────────────
+TOP_K = 5
+top_features = importance_df['Feature'].head(TOP_K).tolist()
+
+# persist for your FastAPI app
+with open('selected_features.json','w') as f:
+    json.dump([f.lower().replace(' ', '_') for f in top_features], f, indent=2)
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 5) Retrain on reduced features
+# ───────────────────────────────────────────────────────────────────────────────
+# rebuild X_scaled as DataFrame for easy column selection
+X_scaled_df = pd.DataFrame(X_scaled, columns=feature_names)
+X_red = X_scaled_df[top_features].values
+
+scaler = StandardScaler()
+Xr_scaled = scaler.fit_transform(X_red)
+pickle.dump(scaler, open('scaler.pkl','wb'))
+
+
+Xr_train, Xr_test, yr_train, yr_test = train_test_split(
+    X_red, y, test_size=0.2, random_state=42
+)
+
+model = build_model(len(top_features))
+model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+    loss='binary_crossentropy',
+    metrics=['accuracy','AUC','Precision','Recall']
+)
+history = model.fit(
+    Xr_train, yr_train,
+    epochs=100,
+    batch_size=32,
+    validation_split=0.2,
+    callbacks=[keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)],
     verbose=1
 )
 
-# 5) Wrap model for SHAP KernelExplainer
-def model_predict(data_matrix: np.ndarray) -> np.ndarray:
-    """Return model predicted probability for each sample."""
-    return model.predict(data_matrix).flatten()
+# final evaluation
+results = model.evaluate(Xr_test, yr_test, verbose=0)
+print("Reduced-model test results:", dict(zip(model.metrics_names, results)))
 
-# 6) Create SHAP explainer with a small background sample
-background = X_train.sample(100, random_state=42).values
-explainer = shap.KernelExplainer(model_predict, background)
+# ───────────────────────────────────────────────────────────────────────────────
+# 6) Save artifacts
+# ───────────────────────────────────────────────────────────────────────────────
+model.save('model.h5')
+with open('scaler.pkl','wb') as f:     pickle.dump(scaler,f)
+for col,le in encoders.items():
+    fn = f"le_{col.replace(' ','_').lower()}.pkl"
+    with open(fn, 'wb') as encoder_file:
+        pickle.dump(le, encoder_file)
 
-# 7) Compute SHAP values on a subset of the test set
-test_subset = X_test.values[:100]
-shap_values = explainer.shap_values(test_subset, nsamples=200)
-
-# 8) Beeswarm (summary) plot
-shap.summary_plot(
-    shap_values,
-    features=test_subset,
-    feature_names=X.columns,
-    show=False
-)
-plt.tight_layout()
-plt.savefig('shap_summary.png')
-plt.close()
-
-# 9) Bar chart of mean absolute SHAP values
-mean_abs_shap = np.abs(shap_values).mean(axis=0)
-importance_df = pd.DataFrame({
-    'Feature': X.columns,
-    'Mean(|SHAP|)': mean_abs_shap
-}).sort_values('Mean(|SHAP|)', ascending=False)
-
-plt.figure(figsize=(10, 6))
-plt.bar(importance_df['Feature'], importance_df['Mean(|SHAP|)'])
-plt.xticks(rotation=45, ha='right')
-plt.title('Mean Absolute SHAP Values')
-plt.tight_layout()
-plt.savefig('shap_bar.png')
-plt.close()
-
-# 10) Print numeric SHAP importances
-print("\nMean Absolute SHAP Values:")
-print(importance_df)
+print("Top features:", top_features)
